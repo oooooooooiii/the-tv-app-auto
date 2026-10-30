@@ -1,10 +1,14 @@
-name: Test Matcher Sync
+name: Sync DB Matcher
 
 on:
+  schedule:
+    - cron: '*/15 * * * *'
   workflow_dispatch:
+  repository_dispatch:
+    types: [trigger-sync]
 
 jobs:
-  test-matching:
+  sync-database:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
@@ -18,12 +22,12 @@ jobs:
       - name: Install Dependencies
         run: |
           pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install requests
 
-      - name: Run Test Matcher
+      - name: Execute Sync Updater
         env:
           FIREBASE_URL: ${{ secrets.FIREBASE_URL }}
           FIREBASE_SECRET: ${{ secrets.FIREBASE_SECRET }}
           SOURCE_API_URL: ${{ secrets.SOURCE_API_URL }}
         run: |
-          python test_matcher.py
+          python sync_updater.py
