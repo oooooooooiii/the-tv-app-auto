@@ -1,0 +1,29 @@
+name: Test Matcher Sync
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-matching:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Test Matcher
+        env:
+          FIREBASE_URL: ${{ secrets.FIREBASE_URL }}
+          FIREBASE_SECRET: ${{ secrets.FIREBASE_SECRET }}
+          SOURCE_API_URL: ${{ secrets.SOURCE_API_URL }}
+        run: |
+          python test_matcher.py
