@@ -30,4 +30,4 @@ jobs:
           FIREBASE_SECRET: ${{ secrets.FIREBASE_SECRET }}
           SOURCE_API_URL: ${{ secrets.SOURCE_API_URL }}
         run: |
-          python sync_updater.py
+          python test_matcher.py
