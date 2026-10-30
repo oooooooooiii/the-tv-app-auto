@@ -2,11 +2,15 @@ import os
 import sys
 import json
 import re
+import time
+from datetime import datetime, timezone, timedelta
 import requests
 
 FIREBASE_URL = os.getenv("FIREBASE_URL")
 FIREBASE_SECRET = os.getenv("FIREBASE_SECRET")
 SOURCE_API_URL = os.getenv("SOURCE_API_URL")
+
+BACKUP_LOGO = "https://i.ibb.co/1Yh8PdLH/1000459066.jpg"
 
 CATEGORY_SYNONYMS = {
     "soccer": ["soccer", "football", "efl cup", "premier league", "laliga", "serie a", "ucl"],
@@ -58,81 +62,114 @@ def is_team_similar(team_a, team_b):
                 return True
     return False
 
-def classify_stream_link(raw_link):
-    if not raw_link:
-        return "NO_LINK", "None"
-    match = re.search(r'playlist/(\d+)/', raw_link)
+def split_teams(event_name):
+    if not event_name:
+        return "", ""
+    parts = re.split(r'\s+(?:vs|at|-)\s+', event_name, maxsplit=1, flags=re.I)
+    if len(parts) == 2:
+        return parts[0].strip(), parts[1].strip()
+    return event_name.strip(), event_name.strip()
+
+def extract_raw_stream_url(link_str):
+    if not link_str:
+        return ""
+    url_match = re.search(r'url=([^"\'\s&]+)', link_str)
+    if url_match:
+        import urllib.parse
+        return urllib.parse.unquote(url_match.group(1))
+    direct_match = re.search(r'(https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*)', link_str)
+    if direct_match:
+        return direct_match.group(1)
+    clean = re.sub(r'<[^>]+>', '', link_str).strip()
+    return clean
+
+def is_main_stream(link_url):
+    match = re.search(r'playlist/(\d+)/', link_url)
     if match:
         stream_id = match.group(1)
-        if len(stream_id) <= 6:
-            return "MAIN_5_DIGIT", stream_id
-        else:
-            return "DEMO_LONG_ID", stream_id
-    return "STANDARD_URL", "N/A"
+        return len(stream_id) <= 6, stream_id
+    return False, ""
 
-def run_test():
+def build_iframe_link(raw_stream_url):
+    return f'<iframe src="https://ivan-player.vercel.app/?play=https://stream-proxy.goalzen.site/proxy/php?url={raw_stream_url}" style="width: 100%; aspect-ratio: 16/9; border: none;" allow="autoplay; encrypted-media; picture-in-picture; fullscreen" allowfullscreen></iframe>'
+
+def create_channel_entry(raw_stream_url):
+    return {
+        "link": build_iframe_link(raw_stream_url),
+        "source": "ivan",
+        "title": "GOALZEN LIVE",
+        "tokenApi": ""
+    }
+
+def run_sync():
     if not FIREBASE_URL or not FIREBASE_SECRET or not SOURCE_API_URL:
-        print("[ERROR] Missing GitHub Secrets: FIREBASE_URL, FIREBASE_SECRET, or SOURCE_API_URL.")
+        print("[ERROR] Missing required secrets: FIREBASE_URL, FIREBASE_SECRET, or SOURCE_API_URL.")
         sys.exit(1)
-
-    print("=" * 60)
-    print("           GOALZEN LIVE SYNC: TEST MATCHER REPORT           ")
-    print("=" * 60)
 
     clean_fb_url = FIREBASE_URL.rstrip('/')
     db_endpoint = f"{clean_fb_url}/sports_live/events.json?auth={FIREBASE_SECRET}"
 
+    print("[*] Fetching Database Events...")
     try:
-        print(f"[*] Fetching Database Events from Firebase...")
         db_res = requests.get(db_endpoint, timeout=15)
         if db_res.status_code != 200:
-            print(f"[!] Database request failed with status: {db_res.status_code}")
+            print(f"[!] Database request failed: {db_res.status_code}")
             sys.exit(1)
-        raw_db = db_res.json() or []
+        raw_db = db_res.json()
         db_events = []
+        max_index = -1
         if isinstance(raw_db, list):
             for idx, ev in enumerate(raw_db):
-                if ev:
+                if ev is not None:
                     db_events.append((idx, ev))
+                    max_index = max(max_index, idx)
         elif isinstance(raw_db, dict):
             for k, ev in raw_db.items():
-                if ev:
-                    db_events.append((int(k) if str(k).isdigit() else k, ev))
-        print(f"[+] Loaded {len(db_events)} events from Database.\n")
+                if ev is not None:
+                    parsed_k = int(k) if str(k).isdigit() else max_index + 1
+                    db_events.append((parsed_k, ev))
+                    max_index = max(max_index, parsed_k)
+        print(f"[+] Found {len(db_events)} events in database.")
     except Exception as e:
-        print(f"[ERROR] Could not load database: {e}")
+        print(f"[ERROR] Failed to read database: {e}")
         sys.exit(1)
 
+    print(f"[*] Fetching API from: {SOURCE_API_URL}...")
     try:
-        print(f"[*] Fetching Live Matches from API: {SOURCE_API_URL}...")
         api_res = requests.get(SOURCE_API_URL, timeout=15)
         if api_res.status_code != 200:
-            print(f"[!] API request failed with status: {api_res.status_code}")
+            print(f"[!] API request failed: {api_res.status_code}")
             sys.exit(1)
-        api_data = api_res.json()
-        api_matches = api_data.get("Live_Data", []) if isinstance(api_data, dict) else api_data
+        api_json = api_res.json()
+        api_matches = api_json.get("Live_Data", []) if isinstance(api_json, dict) else api_json
         print(f"[+] Loaded {len(api_matches)} matches from API.\n")
     except Exception as e:
-        print(f"[ERROR] Could not load API: {e}")
+        print(f"[ERROR] Failed to fetch API: {e}")
         sys.exit(1)
 
-    matched_count = 0
-    unmatched_count = 0
-
-    print("=" * 60)
-    print("                    MATCH ANALYSIS                          ")
-    print("=" * 60)
+    updated_count = 0
+    created_count = 0
+    next_index = max_index + 1
 
     for api_match in api_matches:
-        api_cat = api_match.get("Category") or api_match.get("League_Name") or ""
+        api_cat = api_match.get("Category") or api_match.get("League_Name") or "Sports"
         api_title = api_match.get("Event_Name") or api_match.get("Rivels") or ""
         api_team_a = api_match.get("Team_A") or api_match.get("Team A") or ""
         api_team_b = api_match.get("Team_B") or api_match.get("Team B") or ""
-        api_link = api_match.get("Link") or ""
-        api_link_type, api_stream_id = classify_stream_link(api_link)
 
-        found_db_match = None
-        found_db_index = None
+        if not api_team_a or not api_team_b:
+            parsed_a, parsed_b = split_teams(api_title)
+            api_team_a = api_team_a or parsed_a
+            api_team_b = api_team_b or parsed_b
+
+        api_raw_stream = extract_raw_stream_url(api_match.get("Link", ""))
+        if not api_raw_stream:
+            continue
+
+        api_is_main, api_stream_id = is_main_stream(api_raw_stream)
+
+        matched_db_event = None
+        matched_db_idx = None
 
         for db_idx, db_event in db_events:
             event_info = db_event.get("eventInfo", {})
@@ -153,63 +190,105 @@ def run_test():
             fallback_title_match = is_team_similar(api_title, db_event_name)
 
             if direct_teams_match or fallback_title_match:
-                found_db_match = db_event
-                found_db_index = db_idx
+                matched_db_event = db_event
+                matched_db_idx = db_idx
                 break
 
-        if found_db_match:
-            matched_count += 1
-            channels = found_db_match.get("channels_data") or found_db_match.get("channels") or []
-            db_link_status = "EMPTY (No channels)"
-            has_no_link = False
-            existing_demo_found = False
+        if matched_db_event is not None:
+            channels = matched_db_event.get("channels_data")
+            if not isinstance(channels, list):
+                channels = matched_db_event.get("channels") or []
+                if not isinstance(channels, list):
+                    channels = []
 
-            if channels:
-                links_text = " ".join([ch.get("link", "") for ch in channels])
-                if "#no.link" in links_text:
-                    has_no_link = True
-                    db_link_status = "CONTAINS 'no.link' (Needs Replace)"
+            has_replaced_no_link = False
+            has_upgraded_demo = False
+            already_exists = False
+
+            for ch_idx, ch in enumerate(channels):
+                ch_link = ch.get("link", "")
+                if "no.link" in ch_link:
+                    channels[ch_idx] = create_channel_entry(api_raw_stream)
+                    has_replaced_no_link = True
+                    break
+
+                ch_raw = extract_raw_stream_url(ch_link)
+                if api_raw_stream and (api_raw_stream in ch_link or (ch_raw and ch_raw == api_raw_stream)):
+                    already_exists = True
+
+                ch_is_main, ch_stream_id = is_main_stream(ch_link)
+                if not ch_is_main and api_is_main:
+                    channels[ch_idx] = create_channel_entry(api_raw_stream)
+                    has_upgraded_demo = True
+                    break
+
+            should_update_db = False
+            if has_replaced_no_link:
+                should_update_db = True
+                print(f"[REPLACE] Event #{matched_db_idx} '{api_title}' -> Replaced 'no.link' with API link.")
+            elif has_upgraded_demo:
+                should_update_db = True
+                print(f"[UPGRADE] Event #{matched_db_idx} '{api_title}' -> Upgraded Demo to Main 5-digit link ({api_stream_id}).")
+            elif not already_exists:
+                channels.append(create_channel_entry(api_raw_stream))
+                should_update_db = True
+                print(f"[APPEND] Event #{matched_db_idx} '{api_title}' -> Appended new GOALZEN LIVE stream.")
+
+            if should_update_db:
+                patch_url = f"{clean_fb_url}/sports_live/events/{matched_db_idx}/channels_data.json?auth={FIREBASE_SECRET}"
+                resp = requests.put(patch_url, json=channels, timeout=10)
+                if resp.status_code == 200:
+                    matched_db_event["channels_data"] = channels
+                    updated_count += 1
                 else:
-                    demo_check = [ch for ch in channels if "playlist/" in ch.get("link", "") and len(re.search(r'playlist/(\d+)/', ch.get("link", "")).group(1)) > 6] if any("playlist/" in ch.get("link", "") for ch in channels) else []
-                    if demo_check:
-                        existing_demo_found = True
-                        db_link_status = "CONTAINS DEMO LINK (Can be updated to Main)"
-                    else:
-                        db_link_status = f"HAS {len(channels)} VALID STREAM(S)"
-
-            action_note = "APPEND NEW SERVER LINK"
-            if has_no_link:
-                action_note = "REPLACE '#no.link' WITH THIS API LINK"
-            elif existing_demo_found and api_link_type == "MAIN_5_DIGIT":
-                action_note = "UPDATE EXISTING DEMO LINK -> MAIN 5-DIGIT STREAM"
-
-            print(f"\n[MATCHED] Database Event Index #{found_db_index}")
-            print(f"  • DB Event       : {found_db_match.get('eventInfo', {}).get('eventName', 'N/A')}")
-            print(f"  • DB Category    : {found_db_match.get('cat', 'N/A')}")
-            print(f"  • API Match      : {api_title}")
-            print(f"  • API Category   : {api_cat}")
-            print(f"  • API Stream Type: {api_link_type} (Stream ID: {api_stream_id})")
-            print(f"  • Current DB State: {db_link_status}")
-            print(f"  • Action Planned : >> {action_note} <<")
-            print("-" * 60)
+                    print(f"[!] Failed to update channels_data for #{matched_db_idx}: {resp.status_code}")
         else:
-            unmatched_count += 1
-            print(f"\n[UNMATCHED - NEW EVENT]")
-            print(f"  • API Match      : {api_title}")
-            print(f"  • API Category   : {api_cat}")
-            print(f"  • Teams          : {api_team_a} vs {api_team_b}")
-            print(f"  • API Stream Type: {api_link_type} (Stream ID: {api_stream_id})")
-            print(f"  • Action Planned : >> CREATE AS NEW EVENT IN DATABASE <<")
-            print("-" * 60)
+            now_utc = datetime.now(timezone.utc)
+            start_utc = api_match.get("UTC_Start") or now_utc.strftime("%Y/%m/%d %H:%M:%S +0000")
+            end_utc = api_match.get("UTC_End") or (now_utc + timedelta(hours=3)).strftime("%Y/%m/%d %H:%M:%S +0000")
 
-    print("\n" + "=" * 60)
-    print("                    TEST SUMMARY                            ")
-    print("=" * 60)
-    print(f"Total API Matches Ingested : {len(api_matches)}")
-    print(f"Total Database Events Scanned: {len(db_events)}")
-    print(f"Total Matched Events         : {matched_count}")
-    print(f"Total New (Unmatched) Events : {unmatched_count}")
-    print("=" * 60)
+            team_a_final = api_team_a or api_match.get("League_Name") or "Team A"
+            team_b_final = api_team_b or api_match.get("League_Name") or "Team B"
+            team_a_logo = api_match.get("Team_A_Logo") or api_match.get("Team_Logo") or BACKUP_LOGO
+            team_b_logo = api_match.get("Team_B_Logo") or api_match.get("Team_Logo") or BACKUP_LOGO
+            league_logo = api_match.get("League_Logo") or team_a_logo or BACKUP_LOGO
+
+            new_event_obj = {
+                "cat": api_cat,
+                "title": api_match.get("League_Name") or api_cat,
+                "league_logo": league_logo,
+                "id": int(time.time() * 1000) % 1000000000,
+                "channels_data": [create_channel_entry(api_raw_stream)],
+                "eventInfo": {
+                    "Status": "Upcoming",
+                    "eventName": api_title or f"{team_a_final} vs {team_b_final}",
+                    "isHot": "0",
+                    "startTime": start_utc,
+                    "endTime": end_utc,
+                    "teamA": team_a_final,
+                    "teamAFlag": team_a_logo,
+                    "teamB": team_b_final,
+                    "teamBFlag": team_b_logo
+                }
+            }
+
+            put_url = f"{clean_fb_url}/sports_live/events/{next_index}.json?auth={FIREBASE_SECRET}"
+            put_resp = requests.put(put_url, json=new_event_obj, timeout=10)
+            if put_resp.status_code == 200:
+                print(f"[CREATED] Event #{next_index} '{api_title}' added as new match.")
+                db_events.append((next_index, new_event_obj))
+                next_index += 1
+                created_count += 1
+            else:
+                print(f"[!] Failed to create new event #{next_index}: {put_resp.status_code}")
+
+    print("\n" + "=" * 50)
+    print("                SYNC REPORT SUMMARY                ")
+    print("=" * 50)
+    print(f"Total API Matches Processed : {len(api_matches)}")
+    print(f"Total Existing Events Updated: {updated_count}")
+    print(f"Total New Events Created     : {created_count}")
+    print("=" * 50)
 
 if __name__ == "__main__":
-    run_test()
+    run_sync()
