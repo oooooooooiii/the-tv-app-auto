@@ -95,13 +95,22 @@ def is_main_stream(link_url):
 def build_iframe_link(raw_stream_url):
     return f'<iframe src="https://ivan-player.vercel.app/?play=https://stream-proxy.goalzen.site/proxy/php?url={raw_stream_url}" style="width: 100%; aspect-ratio: 16/9; border: none;" allow="autoplay; encrypted-media; picture-in-picture; fullscreen" allowfullscreen></iframe>'
 
-def create_channel_entry(raw_stream_url):
+def create_channel_entry(raw_stream_url, title):
     return {
         "link": build_iframe_link(raw_stream_url),
         "source": "tta",
-        "title": "GOALZEN LIVE",
+        "title": title,
         "tokenApi": ""
     }
+
+def get_server_title(idx):
+    if idx == 0:
+        return "GOALZEN LIVE"
+    elif idx == 1:
+        return "HD SERVER"
+    elif idx == 2:
+        return "SD SERVER"
+    return f"SERVER {idx + 1}"
 
 def run_sync():
     if not FIREBASE_URL or not FIREBASE_SECRET or not SOURCE_API_URL:
@@ -149,25 +158,73 @@ def run_sync():
         print(f"[ERROR] Failed to fetch API: {e}")
         sys.exit(1)
 
+    grouped_api_matches = []
+    for match in api_matches:
+        category = match.get("Category") or match.get("League_Name") or "Sports"
+        title = match.get("Event_Name") or match.get("Rivels") or ""
+        team_a = match.get("Team_A") or match.get("Team A") or ""
+        team_b = match.get("Team_B") or match.get("Team B") or ""
+
+        if not team_a or not team_b:
+            parsed_a, parsed_b = split_teams(title)
+            team_a = team_a or parsed_a
+            team_b = team_b or parsed_b
+
+        raw_stream = extract_raw_stream_url(match.get("Link", ""))
+        matched_group = None
+
+        for grp in grouped_api_matches:
+            if are_categories_matching(category, grp["category"]):
+                same_teams = (
+                    is_team_similar(team_a, grp["team_a"]) and is_team_similar(team_b, grp["team_b"])
+                ) or (
+                    is_team_similar(team_a, grp["team_b"]) and is_team_similar(team_b, grp["team_a"])
+                )
+                same_title = is_team_similar(title, grp["title"])
+                if same_teams or same_title:
+                    matched_group = grp
+                    break
+
+        if matched_group:
+            if raw_stream and raw_stream not in matched_group["raw_streams"]:
+                matched_group["raw_streams"].append(raw_stream)
+        else:
+            grouped_api_matches.append({
+                "category": category,
+                "title": title,
+                "team_a": team_a,
+                "team_b": team_b,
+                "league_name": match.get("League_Name") or category,
+                "league_logo": match.get("League_Logo") or match.get("Team_A_Logo") or BACKUP_LOGO,
+                "team_a_logo": match.get("Team_A_Logo") or match.get("Team_Logo") or BACKUP_LOGO,
+                "team_b_logo": match.get("Team_B_Logo") or match.get("Team_Logo") or BACKUP_LOGO,
+                "utc_start": match.get("UTC_Start"),
+                "utc_end": match.get("UTC_End"),
+                "raw_streams": [raw_stream] if raw_stream else []
+            })
+
     updated_count = 0
     created_count = 0
     next_index = max_index + 1
 
-    for api_match in api_matches:
-        api_cat = api_match.get("Category") or api_match.get("League_Name") or "Sports"
-        api_title = api_match.get("Event_Name") or api_match.get("Rivels") or ""
-        api_team_a = api_match.get("Team_A") or api_match.get("Team A") or ""
-        api_team_b = api_match.get("Team_B") or api_match.get("Team B") or ""
+    for grp in grouped_api_matches:
+        api_cat = grp["category"]
+        api_title = grp["title"]
+        api_team_a = grp["team_a"]
+        api_team_b = grp["team_b"]
 
-        if not api_team_a or not api_team_b:
-            parsed_a, parsed_b = split_teams(api_title)
-            api_team_a = api_team_a or parsed_a
-            api_team_b = api_team_b or parsed_b
+        valid_main_streams = []
+        for s in grp["raw_streams"]:
+            is_main, _ = is_main_stream(s)
+            if is_main and s not in valid_main_streams:
+                valid_main_streams.append(s)
 
-        api_raw_stream = extract_raw_stream_url(api_match.get("Link", ""))
-        api_is_main, api_stream_id = is_main_stream(api_raw_stream)
-
-        effective_stream = api_raw_stream if api_is_main else FIXED_DEMO_STREAM
+        if valid_main_streams:
+            target_streams = valid_main_streams
+            is_live_data = True
+        else:
+            target_streams = [FIXED_DEMO_STREAM]
+            is_live_data = False
 
         matched_db_event = None
         matched_db_idx = None
@@ -196,73 +253,55 @@ def run_sync():
                 break
 
         if matched_db_event is not None:
-            channels = matched_db_event.get("channels_data")
-            if not isinstance(channels, list):
-                channels = matched_db_event.get("channels") or []
-                if not isinstance(channels, list):
-                    channels = []
+            existing_channels = matched_db_event.get("channels_data")
+            if not isinstance(existing_channels, list):
+                existing_channels = matched_db_event.get("channels") or []
+                if not isinstance(existing_channels, list):
+                    existing_channels = []
 
-            tta_index = -1
-            placeholder_index = -1
-
-            for ch_idx, ch in enumerate(channels):
+            preserved_channels = []
+            for ch in existing_channels:
                 ch_link = ch.get("link", "")
                 if "no.link" in ch_link:
-                    placeholder_index = ch_idx
-                if ch.get("source") == "tta" or "GOALZEN LIVE" in ch.get("title", ""):
-                    tta_index = ch_idx
+                    continue
+                if ch.get("source") == "tta":
+                    continue
+                preserved_channels.append(ch)
 
-            should_update_db = False
+            new_tta_channels = []
+            for idx, stream_url in enumerate(target_streams):
+                new_tta_channels.append(create_channel_entry(stream_url, get_server_title(idx)))
 
-            if placeholder_index != -1:
-                channels[placeholder_index] = create_channel_entry(effective_stream)
-                should_update_db = True
-                print(f"[REPLACE] Event #{matched_db_idx} '{api_title}' -> Replaced 'no.link'")
+            final_channels = preserved_channels + new_tta_channels
 
-            elif tta_index != -1:
-                current_tta_link = channels[tta_index].get("link", "")
-                cur_is_main, _ = is_main_stream(current_tta_link)
-
-                if api_is_main and not cur_is_main:
-                    channels[tta_index] = create_channel_entry(api_raw_stream)
-                    should_update_db = True
-                    print(f"[UPGRADE] Event #{matched_db_idx} '{api_title}' -> Upgraded Demo to Main ({api_stream_id})")
-
-            else:
-                if len(channels) == 0:
-                    channels.append(create_channel_entry(effective_stream))
-                    should_update_db = True
-                    print(f"[SET] Event #{matched_db_idx} '{api_title}' -> Set stream")
-                elif api_is_main:
-                    channels.append(create_channel_entry(api_raw_stream))
-                    should_update_db = True
-                    print(f"[APPEND] Event #{matched_db_idx} '{api_title}' -> Appended Main Stream")
-
-            if should_update_db:
+            if final_channels != existing_channels:
                 patch_url = f"{clean_fb_url}/sports_live/events/{matched_db_idx}/channels_data.json?auth={FIREBASE_SECRET}"
-                resp = requests.put(patch_url, json=channels, timeout=10)
+                resp = requests.put(patch_url, json=final_channels, timeout=10)
                 if resp.status_code == 200:
-                    matched_db_event["channels_data"] = channels
+                    matched_db_event["channels_data"] = final_channels
                     updated_count += 1
+                    status_label = "LIVE" if is_live_data else "DEMO"
+                    print(f"[UPDATED] Event #{matched_db_idx} '{api_title}' -> Synced {len(new_tta_channels)} TTA stream(s) [{status_label}].")
                 else:
                     print(f"[!] Failed to update #{matched_db_idx}: {resp.status_code}")
         else:
             now_utc = datetime.now(timezone.utc)
-            start_utc = api_match.get("UTC_Start") or now_utc.strftime("%Y/%m/%d %H:%M:%S +0000")
-            end_utc = api_match.get("UTC_End") or (now_utc + timedelta(hours=3)).strftime("%Y/%m/%d %H:%M:%S +0000")
+            start_utc = grp["utc_start"] or now_utc.strftime("%Y/%m/%d %H:%M:%S +0000")
+            end_utc = grp["utc_end"] or (now_utc + timedelta(hours=3)).strftime("%Y/%m/%d %H:%M:%S +0000")
 
-            team_a_final = api_team_a or api_match.get("League_Name") or "Team A"
-            team_b_final = api_team_b or api_match.get("League_Name") or "Team B"
-            team_a_logo = api_match.get("Team_A_Logo") or api_match.get("Team_Logo") or BACKUP_LOGO
-            team_b_logo = api_match.get("Team_B_Logo") or api_match.get("Team_Logo") or BACKUP_LOGO
-            league_logo = api_match.get("League_Logo") or team_a_logo or BACKUP_LOGO
+            team_a_final = api_team_a or grp["league_name"] or "Team A"
+            team_b_final = api_team_b or grp["league_name"] or "Team B"
+
+            initial_tta_channels = []
+            for idx, stream_url in enumerate(target_streams):
+                initial_tta_channels.append(create_channel_entry(stream_url, get_server_title(idx)))
 
             new_event_obj = {
                 "cat": api_cat,
-                "title": api_match.get("League_Name") or api_cat,
-                "league_logo": league_logo,
+                "title": grp["league_name"] or api_cat,
+                "league_logo": grp["league_logo"],
                 "id": int(time.time() * 1000) % 1000000000,
-                "channels_data": [create_channel_entry(effective_stream)],
+                "channels_data": initial_tta_channels,
                 "eventInfo": {
                     "Status": "Upcoming",
                     "eventName": api_title or f"{team_a_final} vs {team_b_final}",
@@ -270,9 +309,9 @@ def run_sync():
                     "startTime": start_utc,
                     "endTime": end_utc,
                     "teamA": team_a_final,
-                    "teamAFlag": team_a_logo,
+                    "teamAFlag": grp["team_a_logo"],
                     "teamB": team_b_final,
-                    "teamBFlag": team_b_logo
+                    "teamBFlag": grp["team_b_logo"]
                 }
             }
 
@@ -289,9 +328,9 @@ def run_sync():
     print("\n" + "=" * 50)
     print("                SYNC REPORT SUMMARY                ")
     print("=" * 50)
-    print(f"Total API Matches Processed : {len(api_matches)}")
-    print(f"Total Existing Events Updated: {updated_count}")
-    print(f"Total New Events Created     : {created_count}")
+    print(f"Total Unique Matchups Processed: {len(grouped_api_matches)}")
+    print(f"Total Existing Events Updated   : {updated_count}")
+    print(f"Total New Events Created        : {created_count}")
     print("=" * 50)
 
 if __name__ == "__main__":
